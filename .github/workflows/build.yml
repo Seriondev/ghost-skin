@@ -1,0 +1,451 @@
+name: Build GhostSkin (Fabric 1.21.10)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Generate GhostSkin project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src/main/java/com/ghostskin/mixin
+          mkdir -p src/main/java/com/ghostskin
+          mkdir -p src/main/resources/assets/ghostskin/lang
+
+          cat > settings.gradle <<'GRADLE'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  gradlePluginPortal()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'ghostskin'
+          GRADLE
+
+          cat > gradle.properties <<'PROPS'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          minecraft_version=1.21.10
+          yarn_mappings=1.21.10+build.2
+          loader_version=0.17.2
+          fabric_api_version=0.138.4+1.21.10
+          loom_version=1.11.8
+          mixin_version=0.17.5+mixin.0.8.7
+          mod_version=1.0.0
+          maven_group=com.ghostskin
+          archives_base_name=ghostskin
+          PROPS
+
+          cat > build.gradle <<'GRADLE'
+          plugins {
+              id 'fabric-loom' version "${loom_version}"
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+              annotationProcessor "net.fabricmc:sponge-mixin:${project.mixin_version}"
+          }
+
+          loom {
+              mixin {
+                  useLegacyMixinAp = true
+                  defaultRefmapName = 'ghostskin-refmap.json'
+              }
+          }
+
+          processResources {
+              inputs.property 'version', project.version
+              filesMatching('fabric.mod.json') {
+                  expand 'version': project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 21
+              options.encoding = 'UTF-8'
+          }
+
+          java {
+              toolchain.languageVersion = JavaLanguageVersion.of(21)
+              withSourcesJar()
+          }
+          GRADLE
+
+          cat > src/main/resources/fabric.mod.json <<'JSON'
+          {
+            "schemaVersion": 1,
+            "id": "ghostskin",
+            "version": "${version}",
+            "name": "GhostSkin",
+            "description": "Client-side translucent player skin. Armor and Elytra remain opaque.",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.ghostskin.GhostSkinClient"]
+            },
+            "mixins": ["ghostskin.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.17.2",
+              "minecraft": "~1.21.10",
+              "java": ">=21",
+              "fabric-api": ">=0.138.0"
+            }
+          }
+          JSON
+
+          cat > src/main/resources/ghostskin.mixins.json <<'JSON'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "com.ghostskin.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "refmap": "ghostskin-refmap.json",
+            "client": [
+              "LivingEntityRendererMixin",
+              "ModelCommandRendererMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 1
+            }
+          }
+          JSON
+
+          cat > src/main/resources/assets/ghostskin/lang/en_us.json <<'JSON'
+          {
+            "key.category.ghostskin": "GhostSkin",
+            "key.ghostskin.toggle": "Toggle GhostSkin",
+            "key.ghostskin.opacity_up": "Increase GhostSkin opacity",
+            "key.ghostskin.opacity_down": "Decrease GhostSkin opacity"
+          }
+          JSON
+
+          cat > src/main/java/com/ghostskin/GhostSkinConfig.java <<'JAVA'
+          package com.ghostskin;
+
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.render.entity.state.PlayerEntityRenderState;
+
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Properties;
+
+          public final class GhostSkinConfig {
+              private static final Path FILE = FabricLoader.getInstance()
+                      .getConfigDir().resolve("ghostskin.properties");
+
+              private static boolean enabled = true;
+              private static int opacity = 35;
+
+              private GhostSkinConfig() {}
+
+              public static void load() {
+                  Properties properties = new Properties();
+                  if (Files.exists(FILE)) {
+                      try (InputStream input = Files.newInputStream(FILE)) {
+                          properties.load(input);
+                          enabled = Boolean.parseBoolean(properties.getProperty("enabled", "true"));
+                          opacity = clamp(parseInt(properties.getProperty("opacity"), 35), 5, 100);
+                      } catch (IOException exception) {
+                          System.err.println("[GhostSkin] Could not read config: " + exception.getMessage());
+                      }
+                  } else {
+                      save();
+                  }
+              }
+
+              private static int parseInt(String value, int fallback) {
+                  try {
+                      return value == null ? fallback : Integer.parseInt(value.trim());
+                  } catch (NumberFormatException ignored) {
+                      return fallback;
+                  }
+              }
+
+              private static int clamp(int value, int min, int max) {
+                  return Math.max(min, Math.min(max, value));
+              }
+
+              public static boolean isEnabled() {
+                  return enabled;
+              }
+
+              public static int getOpacity() {
+                  return opacity;
+              }
+
+              public static void toggle() {
+                  enabled = !enabled;
+                  save();
+              }
+
+              public static void changeOpacity(int amount) {
+                  opacity = clamp(opacity + amount, 5, 100);
+                  save();
+              }
+
+              public static boolean isLocalPlayer(PlayerEntityRenderState state) {
+                  MinecraftClient client = MinecraftClient.getInstance();
+                  return client.player != null && state.id == client.player.getId();
+              }
+
+              public static void save() {
+                  Properties properties = new Properties();
+                  properties.setProperty("enabled", Boolean.toString(enabled));
+                  properties.setProperty("opacity", Integer.toString(opacity));
+                  try {
+                      Files.createDirectories(FILE.getParent());
+                      try (OutputStream output = Files.newOutputStream(FILE)) {
+                          properties.store(output, "GhostSkin settings. Opacity: 5-100 percent.");
+                      }
+                  } catch (IOException exception) {
+                      System.err.println("[GhostSkin] Could not save config: " + exception.getMessage());
+                  }
+              }
+          }
+          JAVA
+
+          cat > src/main/java/com/ghostskin/GhostSkinClient.java <<'JAVA'
+          package com.ghostskin;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          public final class GhostSkinClient implements ClientModInitializer {
+              private static KeyBinding toggleKey;
+              private static KeyBinding opacityUpKey;
+              private static KeyBinding opacityDownKey;
+
+              @Override
+              public void onInitializeClient() {
+                  GhostSkinConfig.load();
+
+                  toggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.ghostskin.toggle", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_H,
+                          "key.category.ghostskin"));
+                  opacityUpKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.ghostskin.opacity_up", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_RIGHT_BRACKET,
+                          "key.category.ghostskin"));
+                  opacityDownKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.ghostskin.opacity_down", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_LEFT_BRACKET,
+                          "key.category.ghostskin"));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (toggleKey.wasPressed()) {
+                          GhostSkinConfig.toggle();
+                          notifyPlayer(client, "GhostSkin " + (GhostSkinConfig.isEnabled() ? "ON" : "OFF"));
+                      }
+                      while (opacityUpKey.wasPressed()) {
+                          GhostSkinConfig.changeOpacity(5);
+                          notifyPlayer(client, "GhostSkin opacity: " + GhostSkinConfig.getOpacity() + "%");
+                      }
+                      while (opacityDownKey.wasPressed()) {
+                          GhostSkinConfig.changeOpacity(-5);
+                          notifyPlayer(client, "GhostSkin opacity: " + GhostSkinConfig.getOpacity() + "%");
+                      }
+                  });
+              }
+
+              private static void notifyPlayer(net.minecraft.client.MinecraftClient client, String message) {
+                  if (client.player != null) {
+                      client.player.sendMessage(Text.literal(message), true);
+                  }
+              }
+          }
+          JAVA
+
+          cat > src/main/java/com/ghostskin/GhostSkinRenderContext.java <<'JAVA'
+          package com.ghostskin;
+
+          import net.minecraft.client.render.entity.model.PlayerEntityModel;
+          import net.minecraft.client.render.entity.state.PlayerEntityRenderState;
+
+          public final class GhostSkinRenderContext {
+              private static final ThreadLocal<Integer> ACTIVE_ALPHA = new ThreadLocal<>();
+
+              private GhostSkinRenderContext() {}
+
+              public static void begin(Object model, Object state) {
+                  ACTIVE_ALPHA.remove();
+                  if (model instanceof PlayerEntityModel
+                          && state instanceof PlayerEntityRenderState playerState
+                          && GhostSkinConfig.isEnabled()
+                          && GhostSkinConfig.isLocalPlayer(playerState)) {
+                      int alpha = Math.round(GhostSkinConfig.getOpacity() * 2.55f);
+                      ACTIVE_ALPHA.set(Math.max(0, Math.min(255, alpha)));
+                  }
+              }
+
+              public static int applyToColor(int color) {
+                  Integer alpha = ACTIVE_ALPHA.get();
+                  if (alpha == null) {
+                      return color;
+                  }
+                  return (color & 0x00FFFFFF) | (alpha << 24);
+              }
+
+              public static void clear() {
+                  ACTIVE_ALPHA.remove();
+              }
+          }
+          JAVA
+
+          cat > src/main/java/com/ghostskin/mixin/LivingEntityRendererMixin.java <<'JAVA'
+          package com.ghostskin.mixin;
+
+          import com.ghostskin.GhostSkinConfig;
+          import net.minecraft.client.render.RenderLayer;
+          import net.minecraft.client.render.entity.LivingEntityRenderer;
+          import net.minecraft.client.render.entity.PlayerEntityRenderer;
+          import net.minecraft.client.render.entity.state.LivingEntityRenderState;
+          import net.minecraft.client.render.entity.state.PlayerEntityRenderState;
+          import net.minecraft.client.MinecraftClient;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(LivingEntityRenderer.class)
+          public abstract class LivingEntityRendererMixin {
+              @Inject(method = "getRenderLayer", at = @At("RETURN"), cancellable = true)
+              private void ghostskin$makeOwnSkinTranslucent(
+                      LivingEntityRenderState state,
+                      boolean showBody,
+                      boolean translucent,
+                      boolean showOutline,
+                      CallbackInfoReturnable<RenderLayer> cir) {
+
+                  if (!showBody || !GhostSkinConfig.isEnabled()) {
+                      return;
+                  }
+                  if (!(state instanceof PlayerEntityRenderState playerState)) {
+                      return;
+                  }
+                  if (!(((Object) this) instanceof PlayerEntityRenderer renderer)) {
+                      return;
+                  }
+                  if (!GhostSkinConfig.isLocalPlayer(playerState)) {
+                      return;
+                  }
+
+                  cir.setReturnValue(RenderLayer.getEntityTranslucent(renderer.getTexture(playerState)));
+              }
+          }
+          JAVA
+
+          cat > src/main/java/com/ghostskin/mixin/ModelCommandRendererMixin.java <<'JAVA'
+          package com.ghostskin.mixin;
+
+          import com.ghostskin.GhostSkinRenderContext;
+          import net.minecraft.client.render.OutlineVertexConsumerProvider;
+          import net.minecraft.client.render.RenderLayer;
+          import net.minecraft.client.render.VertexConsumer;
+          import net.minecraft.client.render.VertexConsumerProvider;
+          import net.minecraft.client.render.command.ModelCommandRenderer;
+          import net.minecraft.client.render.command.OrderedRenderCommandQueueImpl;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.ModifyArg;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(ModelCommandRenderer.class)
+          public abstract class ModelCommandRendererMixin {
+              private static final String RENDER_METHOD =
+                      "render(Lnet/minecraft/client/render/command/OrderedRenderCommandQueueImpl$ModelCommand;"
+                      + "Lnet/minecraft/client/render/RenderLayer;"
+                      + "Lnet/minecraft/client/render/VertexConsumer;"
+                      + "Lnet/minecraft/client/render/OutlineVertexConsumerProvider;"
+                      + "Lnet/minecraft/client/render/VertexConsumerProvider$Immediate;)V";
+
+              @Inject(method = RENDER_METHOD, at = @At("HEAD"))
+              private void ghostskin$beginModelRender(
+                      OrderedRenderCommandQueueImpl.ModelCommand<?> command,
+                      RenderLayer renderLayer,
+                      VertexConsumer vertexConsumer,
+                      OutlineVertexConsumerProvider outlineVertexConsumers,
+                      VertexConsumerProvider.Immediate crumblingOverlayVertexConsumers,
+                      CallbackInfo ci) {
+                  GhostSkinRenderContext.begin(command.model(), command.state());
+              }
+
+              @ModifyArg(
+                      method = RENDER_METHOD,
+                      at = @At(
+                              value = "INVOKE",
+                              target = "Lnet/minecraft/client/model/Model;render(Lnet/minecraft/client/util/math/MatrixStack;Lnet/minecraft/client/render/VertexConsumer;III)V"),
+                      index = 4)
+              private int ghostskin$applySkinOpacity(int originalColor) {
+                  return GhostSkinRenderContext.applyToColor(originalColor);
+              }
+
+              @Inject(method = RENDER_METHOD, at = @At("RETURN"))
+              private void ghostskin$endModelRender(
+                      OrderedRenderCommandQueueImpl.ModelCommand<?> command,
+                      RenderLayer renderLayer,
+                      VertexConsumer vertexConsumer,
+                      OutlineVertexConsumerProvider outlineVertexConsumers,
+                      VertexConsumerProvider.Immediate crumblingOverlayVertexConsumers,
+                      CallbackInfo ci) {
+                  GhostSkinRenderContext.clear();
+              }
+          }
+          JAVA
+
+      - name: Compile mod
+        run: gradle --no-daemon clean build --stacktrace
+
+      - name: Upload compiled mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: GhostSkin-Fabric-1.21.10
+          path: build/libs/ghostskin-1.0.0.jar
+          if-no-files-found: error
+          retention-days: 14
